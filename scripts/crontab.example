@@ -1,0 +1,16 @@
+# bq_sync_kit —— 每天把「昨天及以前」的 JSONL 同步到 BigQuery
+#
+# 把下面的 /path/to/bq_sync_kit 换成实际部署路径，然后：
+#   安装:            crontab scripts/crontab.example
+#   追加到已有 crontab: crontab -l | cat - scripts/crontab.example | crontab -
+
+SHELL=/bin/bash
+# 脚本自己写日志，关掉 cron 邮件；失败要靠配置里的 notification 通知
+MAILTO=""
+
+# 03:20 跑，此时昨天的文件早已写完。注意让系统时区和配置里的 timezone
+# 保持一致，否则 cron 的「今天」和工具的「今天」可能不是同一天。
+20 3 * * * /path/to/bq_sync_kit/scripts/bq_sync.sh >> /path/to/bq_sync_kit/logs/cron.log 2>&1
+
+# 可选：傍晚补跑一次，重试白天失败的文件（已成功的会跳过）
+# 30 18 * * * /path/to/bq_sync_kit/scripts/bq_sync.sh >> /path/to/bq_sync_kit/logs/cron.log 2>&1

@@ -1,0 +1,86 @@
+# bq_sync_kit 配置示例
+#
+# 层级：defaults -> project -> job，下层同名键覆盖上层。
+# 所有字符串都支持 ${VAR} 和 ${VAR:-默认值} 形式的环境变量展开。
+
+# 所有项目共用的状态库。表会自动创建。
+mysql:
+  host: ${BQ_SYNC_MYSQL_HOST:-127.0.0.1}
+  port: ${BQ_SYNC_MYSQL_PORT:-3306}
+  user: ${BQ_SYNC_MYSQL_USER:-root}
+  password: ${BQ_SYNC_MYSQL_PASSWORD:-}
+  database: ${BQ_SYNC_MYSQL_DATABASE:-bq_sync}
+  state_table: bq_file_sync_record
+  create_database: true
+  # 也可以直接给 DSN，给了就忽略上面的 host/port/user/...
+  # dsn: mysql+asyncmy://user:pass@127.0.0.1:3306/bq_sync?charset=utf8mb4
+
+defaults:
+  # 判断“当前日期之前”所用的时区。
+  timezone: Asia/Shanghai
+  location: US
+  # 与 bq load --noreplace --source_format=NEWLINE_DELIMITED_JSON 等价。
+  write_disposition: WRITE_APPEND
+  autodetect_schema: false
+  ignore_unknown_values: false
+  max_bad_records: 0
+  skip_empty_files: true
+  # 每个 100 MiB 上传分片的超时，以及传完后等待 load job 的总超时。
+  upload_timeout_seconds: 300
+  job_timeout_seconds: 3600
+  notification:
+    enabled: ${BQ_SYNC_NOTIFY_ENABLED:-false}
+    url: ${BQ_SYNC_NOTIFY_URL:-}
+    method: POST
+    parameter_format: json      # json | form | query
+    params:
+      title: "{title}"
+      content: "{content}"
+    timeout_seconds: 20
+
+projects:
+  # ---- 项目一：文件名里带 YYYY-MM-DD ----
+  - name: a
+    # 相对路径都相对 root 解析；不写 root 时相对配置文件所在目录。
+    root: /home/work/a
+    project_id: ${MEDIACRAWLER_GCP_PROJECT:-}
+    credentials_path: ${MEDIACRAWLER_GCP_CREDENTIALS:-}
+    location: US
+    jobs:
+      - name: xxx
+        source_glob: data/creator_contents_*.jsonl
+        target_table: xx.xxx
+        # 留空表示上传成功后保留源文件。
+        archive_dir: /data1/
+        archive_layout: flat     # flat | date（date 会按数据日期建子目录）
+
+  # ---- 项目二：文件名里是 YYYYMMDD ----
+  - name: b
+    root: /home/work/b
+    project_id: ${JOBLINK_GCP_PROJECT:-}
+    credentials_path: ${JOBLINK_GCP_CREDENTIALS:-}
+    location: asia-east2
+    date_pattern: '(\d{8})'
+    date_format: "%Y%m%d"
+    jobs:
+      - name: xxx
+        source_glob: "*.jsonl"
+        target_table: xx.xxx
+        archive_dir: archive/
+
+  # ---- 项目三：日期在目录名上，文件名不带日期 ----
+  - name: c
+    root: /home/work/c
+    project_id: ${CAILI_GCP_PROJECT:-}
+    jobs:
+      - name: batch_out
+        # 递归匹配需要显式打开 recursive。
+        source_globs:
+          - "out-*/out_*.jsonl"
+        recursive: false
+        date_source: path        # filename | path | mtime
+        date_pattern: 'out-(\d{8})/'
+        date_format: "%Y%m%d"
+        target_table: aaa.raw_batch_out
+        archive_dir: /data1/archive/
+        archive_layout: date
