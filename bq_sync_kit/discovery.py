@@ -22,14 +22,40 @@ class DiscoveredFile:
     path: Path
     segment_date: date
     size: int
+    # 以下三项只有 producer 的 manifest 会填，普通 glob 发现留空。
+    expected_rows: int | None = None
+    target_table: str = ""
+    cleanup_token: str = ""
 
 
-def sha256_file(path: Path) -> str:
+@dataclass(frozen=True)
+class FileDigest:
+    sha256: str
+    line_count: int
+
+
+def digest_file(path: Path) -> FileDigest:
+    """一遍读完，同时得到 sha256 和 JSONL 行数。
+
+    行数用来和 producer 声明的 rows 对账；因为反正要为 sha256 读一次整个文件，
+    顺手数换行不额外增加 IO。
+    """
     digest = hashlib.sha256()
+    newlines = 0
+    last_byte = b""
     with path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+            newlines += chunk.count(b"\n")
+            last_byte = chunk[-1:]
+    # 最后一行没有换行符时也算一行。
+    if last_byte and last_byte != b"\n":
+        newlines += 1
+    return FileDigest(sha256=digest.hexdigest(), line_count=newlines)
+
+
+def sha256_file(path: Path) -> str:
+    return digest_file(path).sha256
 
 
 def resolve_path(value: str, *, root: Path) -> Path:
@@ -98,7 +124,7 @@ def discover_files(job: SyncJob, *, today: date) -> list[DiscoveredFile]:
             if segment_date is None:
                 logger.warning("跳过无法识别数据日期的文件: %s", path)
                 continue
-            if segment_date >= today:
+            if job.require_past_date and segment_date >= today:
                 continue
 
             size = path.stat().st_size

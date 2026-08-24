@@ -136,3 +136,32 @@ def test_include_merges_project_files(tmp_path: Path):
         job.bigquery.location == "asia-east2" for job in settings.iter_jobs()
     )
     assert settings.projects[0].jobs[0].root == Path("/srv/alpha")
+
+
+def test_manifest_producer_does_not_need_a_source_glob(base_document):
+    job = base_document["projects"][0]["jobs"][0]
+    del job["source_glob"]
+    job["producer"] = {"command": "sh export.sh"}
+
+    settings = build_settings(base_document)
+
+    assert settings.projects[0].jobs[0].source_globs == ()
+
+
+def test_glob_producer_still_needs_a_source_glob(base_document):
+    job = base_document["projects"][0]["jobs"][0]
+    del job["source_glob"]
+    job["producer"] = {"command": "sh export.sh", "manifest": False}
+
+    with pytest.raises(ConfigError, match="必须配置 source_glob"):
+        build_settings(base_document)
+
+
+def test_hooks_are_inheritable_from_defaults(base_document):
+    base_document["defaults"]["cleanup"] = {"command": "sh clean.sh"}
+    base_document["projects"][0]["producer"] = {"command": "sh export.sh"}
+
+    job = build_settings(base_document).projects[0].jobs[0]
+
+    assert job.cleanup.command == ("sh", "clean.sh")
+    assert job.producer.command == ("sh", "export.sh")

@@ -19,10 +19,13 @@ from bq_sync_kit.bigquery_loader import (
 from bq_sync_kit.config import KitSettings, SyncJob
 from bq_sync_kit.discovery import (
     DiscoveredFile,
+    FileDigest,
+    digest_file,
     discover_files,
     move_to_archive,
-    sha256_file,
 )
+from bq_sync_kit.hooks import HookError, cleanup_env, run_hook, run_producer
+from bq_sync_kit.models import CLEANUP_DONE, CLEANUP_FAILED
 from bq_sync_kit.notifier import FailureNotifier
 from bq_sync_kit.repository import FileSyncMetadata, SyncRepository
 
@@ -39,6 +42,8 @@ class JobSummary:
     failed: int = 0
     archived: int = 0
     archive_failed: int = 0
+    cleaned: int = 0
+    cleanup_failed: int = 0
 
     @property
     def qualified_name(self) -> str:
@@ -77,14 +82,27 @@ class SyncSummary:
         return self._total("archive_failed")
 
     @property
+    def cleaned(self) -> int:
+        return self._total("cleaned")
+
+    @property
+    def cleanup_failed(self) -> int:
+        return self._total("cleanup_failed")
+
+    @property
     def ok(self) -> bool:
-        return self.failed == 0 and self.archive_failed == 0
+        return (
+            self.failed == 0
+            and self.archive_failed == 0
+            and self.cleanup_failed == 0
+        )
 
     def format_line(self) -> str:
         return (
             f"discovered={self.discovered} skipped={self.skipped} "
             f"succeeded={self.succeeded} failed={self.failed} "
-            f"archived={self.archived} archive_failed={self.archive_failed}"
+            f"archived={self.archived} archive_failed={self.archive_failed} "
+            f"cleaned={self.cleaned} cleanup_failed={self.cleanup_failed}"
         )
 
 
@@ -96,7 +114,7 @@ class SyncRunner:
         repository: SyncRepository | None = None,
         loader: BigQueryJsonlLoader | None = None,
         notifier_factory: Callable[[SyncJob], FailureNotifier] | None = None,
-        hash_function: Callable[[Path], str] = sha256_file,
+        digest_function: Callable[[Path], FileDigest] = digest_file,
     ):
         self.settings = settings
         self.repository = repository or SyncRepository(settings.mysql)
@@ -105,7 +123,7 @@ class SyncRunner:
             lambda job: FailureNotifier(job.notification)
         )
         self._notifiers: dict[str, FailureNotifier] = {}
-        self.hash_function = hash_function
+        self.digest_function = digest_function
 
     def _notifier(self, job: SyncJob) -> FailureNotifier:
         notifier = self._notifiers.get(job.qualified_name)
@@ -132,67 +150,275 @@ class SyncRunner:
             logger.warning("没有匹配到任何任务")
             return SyncSummary()
 
-        plan: list[tuple[SyncJob, list[DiscoveredFile]]] = []
-        for job in selected:
-            today = boundary_date or self.today_for(job)
-            try:
-                files = discover_files(job, today=today)
-            except Exception as exc:
-                logger.error("%s 扫描文件失败: %s", job.qualified_name, exc)
-                raise
-            if limit_per_job is not None:
-                files = files[:limit_per_job]
-            plan.append((job, files))
-
         if dry_run:
-            return self._report_dry_run(plan)
+            return await self._report_dry_run(
+                selected, boundary_date=boundary_date, limit_per_job=limit_per_job
+            )
 
         summary = SyncSummary()
         await self.repository.initialize()
         try:
             # 按项目加锁：不同项目可以并行跑，同一项目只允许一个进程。
-            for project_name in dict.fromkeys(job.project_name for job, _ in plan):
-                project_plan = [
-                    item for item in plan if item[0].project_name == project_name
+            # producer 会改动源端数据，必须在锁内执行，否则两台机器会各导一份。
+            for project_name in dict.fromkeys(
+                job.project_name for job in selected
+            ):
+                project_jobs = [
+                    job for job in selected if job.project_name == project_name
                 ]
                 async with self.repository.run_lock(project_name):
-                    for job, files in project_plan:
-                        summary.jobs.append(await self._run_job(job, files))
+                    for job in project_jobs:
+                        job_summary = JobSummary(
+                            project_name=job.project_name,
+                            job_name=job.job_name,
+                        )
+                        summary.jobs.append(job_summary)
+                        today = boundary_date or self.today_for(job)
+                        files = await self._prepare_files(
+                            job,
+                            today=today,
+                            limit_per_job=limit_per_job,
+                            summary=job_summary,
+                        )
+                        if files is None:
+                            continue
+                        job_summary.discovered = len(files)
+                        await self._run_job(job, files, job_summary)
         finally:
             await self.repository.close()
             self.loader.close()
         return summary
 
-    def _report_dry_run(
-        self, plan: Sequence[tuple[SyncJob, list[DiscoveredFile]]]
+    async def _prepare_files(
+        self,
+        job: SyncJob,
+        *,
+        today: date,
+        limit_per_job: int | None,
+        summary: JobSummary,
+    ) -> list[DiscoveredFile] | None:
+        """准备本轮要处理的文件；返回 None 表示这个 job 本轮不再往下走。"""
+        if job.cleanup.enabled:
+            try:
+                await self._retry_unfinished_cleanups(job, summary)
+            except HookError as exc:
+                if not job.producer.enabled:
+                    # 没有 producer 就不存在重复导出的风险，记一笔继续往下走。
+                    summary.cleanup_failed += 1
+                    logger.error("%s: %s", job.qualified_name, exc)
+                    return await self._discover(job, today, limit_per_job)
+                # 源端还留着已导出的数据，再跑一次 producer 就会导出第二遍。
+                summary.failed += 1
+                logger.error("%s: %s", job.qualified_name, exc)
+                await self._notify(
+                    job,
+                    title=f"[bq_sync_kit] 待清理数据未处理完: {job.qualified_name}",
+                    content=(
+                        f"上一轮的 cleanup 没有成功，本轮已跳过 producer 以免重复导出。\n"
+                        f"错误: {exc}"
+                    ),
+                )
+                return None
+
+        if job.producer.enabled:
+            try:
+                produced = await run_producer(job, today=today)
+            except HookError as exc:
+                if job.producer.on_error == "skip":
+                    logger.warning("%s: producer 失败，已跳过: %s",
+                                   job.qualified_name, exc)
+                    return None
+                summary.failed += 1
+                logger.error("%s: %s", job.qualified_name, exc)
+                await self._notify(
+                    job,
+                    title=f"[bq_sync_kit] producer 执行失败: {job.qualified_name}",
+                    content=str(exc),
+                )
+                return None
+            if produced is not None:
+                files = await self._with_retryable(job, produced)
+                if limit_per_job is not None:
+                    files = files[:limit_per_job]
+                return files
+
+        return await self._discover(job, today, limit_per_job)
+
+    async def _discover(
+        self, job: SyncJob, today: date, limit_per_job: int | None
+    ) -> list[DiscoveredFile]:
+        try:
+            files = discover_files(job, today=today)
+        except Exception as exc:
+            logger.error("%s 扫描文件失败: %s", job.qualified_name, exc)
+            raise
+        if limit_per_job is not None:
+            files = files[:limit_per_job]
+        return files
+
+    async def _with_retryable(
+        self, job: SyncJob, produced: Sequence[DiscoveredFile]
+    ) -> list[DiscoveredFile]:
+        """把状态表里还没成功进仓的文件并进本轮产物一起重试。"""
+        files = {file.path: file for file in produced}
+        for record in await self.repository.retryable_records(
+            job.project_name, job.job_name
+        ):
+            path = Path(record["file_path"])
+            if path in files:
+                continue
+            if not path.is_file():
+                logger.error(
+                    "%s: 待重试的文件已不存在，需要人工确认: %s (状态 %s)",
+                    job.qualified_name,
+                    path,
+                    record["status"],
+                )
+                continue
+            logger.info("%s: 重试上一轮未完成的文件: %s", job.qualified_name, path)
+            files[path] = DiscoveredFile(
+                path=path,
+                segment_date=record["segment_date"],
+                size=record["file_size"],
+                expected_rows=record["expected_rows"],
+                target_table=record["target_table"],
+                cleanup_token=record["cleanup_token"] or "",
+            )
+        return sorted(
+            files.values(), key=lambda item: (item.segment_date, str(item.path))
+        )
+
+    async def _retry_unfinished_cleanups(
+        self, job: SyncJob, summary: JobSummary
+    ) -> None:
+        """把上一轮没做完的 cleanup 补上，补不上就抛错拦住 producer。"""
+        if not job.cleanup.enabled:
+            return
+        pending = await self.repository.unfinished_cleanups(
+            job.project_name, job.job_name
+        )
+        if not pending:
+            return
+        logger.info(
+            "%s: 有 %d 条记录的 cleanup 未完成，先补做",
+            job.qualified_name,
+            len(pending),
+        )
+        stuck: list[str] = []
+        for record in pending:
+            path = Path(record["file_path"])
+            try:
+                await self._run_cleanup(
+                    job,
+                    file_key=record["file_key"],
+                    path=path,
+                    segment_date=record["segment_date"],
+                    target_table=record["target_table"],
+                    cleanup_token=record["cleanup_token"] or "",
+                    rows=record["expected_rows"],
+                    sha256=record["file_sha256"] or "",
+                )
+            except HookError as exc:
+                stuck.append(f"{path}: {exc}")
+                continue
+            summary.cleaned += 1
+        if stuck:
+            raise HookError("; ".join(stuck))
+
+    async def _run_cleanup(
+        self,
+        job: SyncJob,
+        *,
+        file_key: str,
+        path: Path,
+        segment_date: date,
+        target_table: str,
+        cleanup_token: str,
+        rows: int | None,
+        sha256: str,
+    ) -> None:
+        """执行 cleanup 钩子并把结果落库；失败时抛 HookError。"""
+        try:
+            await run_hook(
+                job.cleanup,
+                root=job.root,
+                label=f"{job.qualified_name} cleanup",
+                env=cleanup_env(
+                    job,
+                    path=path,
+                    segment_date=segment_date,
+                    target_table=target_table,
+                    cleanup_token=cleanup_token,
+                    rows=rows,
+                    sha256=sha256,
+                ),
+            )
+        except HookError as exc:
+            await self.repository.set_cleanup_status(
+                job.project_name,
+                job.job_name,
+                file_key,
+                status=CLEANUP_FAILED,
+                error_message=str(exc),
+            )
+            raise
+        await self.repository.set_cleanup_status(
+            job.project_name, job.job_name, file_key, status=CLEANUP_DONE
+        )
+        logger.info("已清理源端数据: %s", path)
+
+    async def _report_dry_run(
+        self,
+        selected: Sequence[SyncJob],
+        *,
+        boundary_date: date | None,
+        limit_per_job: int | None,
     ) -> SyncSummary:
         summary = SyncSummary()
-        for job, files in plan:
+        for job in selected:
+            today = boundary_date or self.today_for(job)
             job_summary = JobSummary(
-                project_name=job.project_name,
-                job_name=job.job_name,
-                discovered=len(files),
+                project_name=job.project_name, job_name=job.job_name
             )
+            summary.jobs.append(job_summary)
+
+            files: list[DiscoveredFile] | None = None
+            if job.producer.enabled:
+                if job.producer.run_on_dry_run:
+                    files = await run_producer(job, today=today, dry_run=True)
+                else:
+                    # producer 会改动源端数据，dry-run 默认不碰它。
+                    logger.info(
+                        "[dry-run] %s: 跳过 producer (%s)，产物未知",
+                        job.qualified_name,
+                        job.producer.display,
+                    )
+                    if job.producer.manifest:
+                        continue
+            if files is None:
+                files = discover_files(job, today=today)
+            if limit_per_job is not None:
+                files = files[:limit_per_job]
+
+            job_summary.discovered = len(files)
             for file in files:
                 logger.info(
-                    "[dry-run] %s: %s (%s) -> %s, archive_dir=%s",
+                    "[dry-run] %s: %s (%s) -> %s, archive_dir=%s, cleanup=%s",
                     job.qualified_name,
                     file.path,
                     file.segment_date.isoformat(),
-                    job.target_table,
+                    file.target_table or job.target_table,
                     job.archive_dir or "(不归档)",
+                    job.cleanup.display or "(不清理)",
                 )
-            summary.jobs.append(job_summary)
         return summary
 
     async def _run_job(
-        self, job: SyncJob, files: Sequence[DiscoveredFile]
+        self,
+        job: SyncJob,
+        files: Sequence[DiscoveredFile],
+        summary: JobSummary,
     ) -> JobSummary:
-        summary = JobSummary(
-            project_name=job.project_name,
-            job_name=job.job_name,
-            discovered=len(files),
-        )
         logger.info(
             "%s: 待处理文件 %d 个 -> %s",
             job.qualified_name,
@@ -229,7 +455,7 @@ class SyncRunner:
         self, job: SyncJob, file: DiscoveredFile, summary: JobSummary
     ) -> None:
         stat_before = file.path.stat()
-        file_sha256 = await asyncio.to_thread(self.hash_function, file.path)
+        digest = await asyncio.to_thread(self.digest_function, file.path)
         stat_after = file.path.stat()
         if (
             stat_before.st_size != stat_after.st_size
@@ -237,20 +463,65 @@ class SyncRunner:
         ):
             raise RuntimeError(f"计算摘要期间文件仍在写入: {file.path}")
 
+        if (
+            file.expected_rows is not None
+            and file.expected_rows != digest.line_count
+        ):
+            # 导出被截断是唯一会真丢数据的场景：这里拦住，cleanup 就不会执行。
+            raise RuntimeError(
+                f"行数与 producer 声明的不一致: {file.path} "
+                f"声明 {file.expected_rows} 行，实际 {digest.line_count} 行"
+            )
+
         metadata = FileSyncMetadata(
             project_name=job.project_name,
             job_name=job.job_name,
             path=file.path,
             segment_date=file.segment_date,
             size=stat_after.st_size,
-            sha256=file_sha256,
-            target_table=job.target_table,
+            sha256=digest.sha256,
+            target_table=file.target_table or job.target_table,
+            expected_rows=file.expected_rows,
+            cleanup_token=file.cleanup_token,
         )
-        attempt = await self.repository.reserve_attempt(metadata)
+        attempt = await self.repository.reserve_attempt(
+            metadata, cleanup_required=job.cleanup.enabled
+        )
+        # 文件已经通过校验并落库（有 sha256、有“必须 load 这个文件”的记录），
+        # 到这里就算本工具正确收下了数据，可以让源端把已导出的行删掉。
+        if job.cleanup.enabled and not attempt.cleanup_done:
+            try:
+                await self._run_cleanup(
+                    job,
+                    file_key=metadata.file_key,
+                    path=file.path,
+                    segment_date=file.segment_date,
+                    target_table=metadata.target_table,
+                    cleanup_token=file.cleanup_token,
+                    rows=file.expected_rows,
+                    sha256=digest.sha256,
+                )
+            except HookError as exc:
+                # 清理失败不该拦住数据进仓；但源端还留着这批行，下一轮会先补做
+                # cleanup，补不上就不会再跑 producer。
+                summary.cleanup_failed += 1
+                logger.error("清理源端数据失败: %s: %s", file.path, exc)
+                await self._notify(
+                    job,
+                    title=f"[bq_sync_kit] 清理失败: {job.qualified_name}",
+                    content=(
+                        f"文件: {file.path}\n"
+                        f"cleanup_token: {file.cleanup_token or '(空)'}\n"
+                        f"错误: {exc}"
+                    ),
+                )
+            else:
+                summary.cleaned += 1
+
         logger.info(
             "开始上传: %s -> %s, attempt=%s, resumed=%s, job_id=%s",
             file.path,
-            job.target_table,
+            metadata.target_table,
             attempt.attempt_count,
             attempt.resumed,
             attempt.job_id,
@@ -261,7 +532,7 @@ class SyncRunner:
                 self.loader.load,
                 job_id=attempt.job_id,
                 path=file.path,
-                target_table=job.target_table,
+                target_table=metadata.target_table,
                 settings=job.bigquery,
             )
         except Exception as exc:

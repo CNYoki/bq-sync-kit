@@ -9,12 +9,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import glob as globlib
+import logging
 import os
 from pathlib import Path
 import re
+import shlex
 from typing import Any, Iterator, Mapping, MutableMapping, Sequence
 
 import yaml
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_DATE_PATTERN = r"(\d{4}-\d{2}-\d{2})"
@@ -45,6 +50,9 @@ _INHERITABLE_KEYS = frozenset(
         "upload_timeout_seconds",
         "job_timeout_seconds",
         "notification",
+        "producer",
+        "cleanup",
+        "require_past_date",
     }
 )
 
@@ -68,6 +76,9 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
     "upload_timeout_seconds": 300.0,
     "job_timeout_seconds": 3600.0,
     "notification": {},
+    "producer": {},
+    "cleanup": {},
+    "require_past_date": True,
 }
 
 _VALID_DATE_SOURCES = frozenset({"filename", "path", "mtime"})
@@ -75,6 +86,7 @@ _VALID_ARCHIVE_LAYOUTS = frozenset({"flat", "date"})
 _VALID_WRITE_DISPOSITIONS = frozenset(
     {"WRITE_APPEND", "WRITE_TRUNCATE", "WRITE_EMPTY"}
 )
+_VALID_HOOK_ON_ERROR = frozenset({"fail", "skip"})
 
 
 class ConfigError(ValueError):
@@ -230,6 +242,106 @@ class NotificationSettings:
 
 
 @dataclass(frozen=True)
+class HookSettings:
+    """一个外挂脚本的执行参数。command 为空表示该钩子未启用。"""
+
+    command: tuple[str, ...] = ()
+    command_line: str = ""
+    shell: bool = False
+    cwd: str = ""
+    env: Mapping[str, str] = field(default_factory=dict)
+    timeout_seconds: float = 1800.0
+    on_error: str = "fail"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.command_line if self.shell else self.command)
+
+    @property
+    def display(self) -> str:
+        return self.command_line if self.shell else " ".join(self.command)
+
+    @classmethod
+    def from_mapping(
+        cls, value: Mapping[str, Any] | None, *, where: str, **extra: Any
+    ) -> "HookSettings":
+        value = value or {}
+        shell = _as_bool(value.get("shell", False), f"{where}.shell")
+        raw_command = value.get("command", "")
+        command: tuple[str, ...] = ()
+        command_line = ""
+        if isinstance(raw_command, str):
+            command_line = raw_command.strip()
+            if command_line and not shell:
+                try:
+                    command = tuple(shlex.split(command_line))
+                except ValueError as exc:
+                    raise ConfigError(
+                        f"{where}.command 无法解析为参数列表: {exc}"
+                    ) from exc
+        elif isinstance(raw_command, Sequence):
+            command = tuple(
+                str(item) for item in raw_command if str(item).strip()
+            )
+            command_line = shlex.join(command) if command else ""
+            if shell and not command_line:
+                command_line = ""
+        else:
+            raise ConfigError(f"{where}.command 需要字符串或字符串数组")
+
+        raw_env = value.get("env") or {}
+        if not isinstance(raw_env, Mapping):
+            raise ConfigError(f"{where}.env 需要是映射")
+
+        on_error = str(value.get("on_error", "fail")).strip().lower()
+        if on_error not in _VALID_HOOK_ON_ERROR:
+            raise ConfigError(
+                f"{where}.on_error 仅支持 "
+                f"{', '.join(sorted(_VALID_HOOK_ON_ERROR))}"
+            )
+
+        return cls(
+            command=command,
+            command_line=command_line,
+            shell=shell,
+            cwd=str(value.get("cwd", "")).strip(),
+            env={str(key): str(item) for key, item in raw_env.items()},
+            timeout_seconds=_as_float(
+                value.get("timeout_seconds", 1800),
+                f"{where}.timeout_seconds",
+                minimum=0,
+            ),
+            on_error=on_error,
+            **extra,
+        )
+
+
+@dataclass(frozen=True)
+class ProducerSettings(HookSettings):
+    """产出 JSONL 的外挂脚本。"""
+
+    manifest: bool = True
+    run_on_dry_run: bool = False
+
+    @classmethod
+    def from_mapping(
+        cls, value: Mapping[str, Any] | None, *, where: str, **extra: Any
+    ) -> "ProducerSettings":
+        value = value or {}
+        return super().from_mapping(  # type: ignore[return-value]
+            value,
+            where=where,
+            manifest=_as_bool(
+                value.get("manifest", True), f"{where}.manifest"
+            ),
+            run_on_dry_run=_as_bool(
+                value.get("run_on_dry_run", False), f"{where}.run_on_dry_run"
+            ),
+            **extra,
+        )
+
+
+@dataclass(frozen=True)
 class BigQuerySettings:
     """一个 load job 需要的全部 BigQuery 参数。"""
 
@@ -268,6 +380,9 @@ class SyncJob:
     timezone: str
     bigquery: BigQuerySettings
     notification: NotificationSettings
+    producer: ProducerSettings
+    cleanup: HookSettings
+    require_past_date: bool
 
     @property
     def qualified_name(self) -> str:
@@ -446,13 +561,24 @@ def _build_job(
 
     resolved = _merge(inherited, _inheritable(raw_job))
 
+    producer = ProducerSettings.from_mapping(
+        resolved.get("producer"), where=f"{where}.producer"
+    )
+    cleanup = HookSettings.from_mapping(
+        resolved.get("cleanup"), where=f"{where}.cleanup"
+    )
+    require_past_date = _as_bool(
+        resolved["require_past_date"], f"{where}.require_past_date"
+    )
+
     raw_globs = raw_job.get("source_globs") or raw_job.get("source_glob") or ()
     if isinstance(raw_globs, str):
         raw_globs = [raw_globs]
     source_globs = tuple(
         str(item).strip() for item in raw_globs if str(item).strip()
     )
-    if not source_globs:
+    if not source_globs and not (producer.enabled and producer.manifest):
+        # 走 manifest 的 job 由 producer 声明产出，不需要再配 glob。
         raise ConfigError(f"{where} 必须配置 source_glob 或 source_globs")
 
     target_table = str(raw_job.get("target_table", "")).strip()
@@ -512,6 +638,9 @@ def _build_job(
         notification=NotificationSettings.from_mapping(
             resolved.get("notification")
         ),
+        producer=producer,
+        cleanup=cleanup,
+        require_past_date=require_past_date,
     )
 
 

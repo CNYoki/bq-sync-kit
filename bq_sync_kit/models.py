@@ -26,6 +26,12 @@ STATUS_UPLOADING = "uploading"
 STATUS_SUCCESS = "success"
 STATUS_FAILED = "failed"
 
+# cleanup 钩子的状态：pending 表示已登记待清理，done / failed 是执行结果。
+# 为空表示这个 job 没有配 cleanup。
+CLEANUP_PENDING = "pending"
+CLEANUP_DONE = "done"
+CLEANUP_FAILED = "failed"
+
 
 def build_state_table(table_name: str, metadata: MetaData | None = None) -> Table:
     metadata = metadata if metadata is not None else MetaData()
@@ -54,6 +60,12 @@ def build_state_table(table_name: str, metadata: MetaData | None = None) -> Tabl
         Column("loaded_rows", BigInteger),
         Column("archived_path", Text),
         Column("error_message", Text),
+        # producer 在 manifest 里声明的行数，用来和实际文件行数对账。
+        Column("expected_rows", BigInteger),
+        # cleanup 钩子的上下文与状态；崩溃后靠它把没做完的清理补上。
+        Column("cleanup_token", Text),
+        Column("cleanup_status", String(20)),
+        Column("cleanup_error", Text),
         Column("started_at", DateTime),
         Column("synced_at", DateTime),
         Column(
