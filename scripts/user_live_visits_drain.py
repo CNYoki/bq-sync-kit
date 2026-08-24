@@ -8,6 +8,10 @@
 这张表没有自增主键（uid × web_rid × date_day 是复合主键），所以删除不能按 id 区间
 切，改成按 date_day 整天切：一天一个文件，一天一个 cleanup token，导完整天删整天。
 
+**date_day 存的是 UTC 日期**，所以 kit 里这个 job 必须配 `timezone: UTC`——边界日期
+是按 job 时区算的，配成 Asia/Shanghai 会早 8 小时，导致 UTC 那一天还没过完就被导出
+并删除，剩下的写入下一轮又导一遍，在 BigQuery 里变成重复行。
+
 只处理 date_day 早于边界日期（默认今天）的数据，当天还在写的那一天不碰。一天一旦
 被导出，cleanup 就把 `date_day = D` 的行全删掉，不看 updated_at。代价是导出到删除
 之间那几秒里如果有人补写 date_day = D 的行，会被一起删掉——写入方只写当天数据时
