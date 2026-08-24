@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""状态表的自动补列。"""
+"""状态层：自动补列，以及建库时的连接参数。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,9 @@ from typing import Any
 
 from sqlalchemy import inspect, text
 
+import pytest
+
+from bq_sync_kit import db
 from bq_sync_kit.config import MySQLSettings
 from bq_sync_kit.db import create_engine
 from bq_sync_kit.repository import SyncRepository
@@ -78,3 +81,49 @@ async def test_initialize_adds_columns_to_a_legacy_table(
     assert _NEW_COLUMNS <= columns
     assert len(records) == 1
     assert records[0]["cleanup_status"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_database_connects_without_the_target_database(monkeypatch):
+    """建库时必须先断开库名，否则连的就是那个还不存在的库。
+
+    URL.set() 会忽略值为 None 的参数，用它清 database 是无效的——这条曾经让
+    create_database 在全新的状态库上必然失败（MySQL 1049）。
+    """
+    recorded: list[Any] = []
+
+    class FakeConnection:
+        async def scalar(self, *args: Any, **kwargs: Any) -> int:
+            return 1  # 库已存在，走不到 CREATE DATABASE
+
+        async def __aenter__(self) -> "FakeConnection":
+            return self
+
+        async def __aexit__(self, *exc_info: Any) -> None:
+            return None
+
+    class FakeEngine:
+        def connect(self) -> FakeConnection:
+            return FakeConnection()
+
+        async def dispose(self) -> None:
+            return None
+
+    def fake_create_async_engine(url: Any, **kwargs: Any) -> FakeEngine:
+        recorded.append(url)
+        return FakeEngine()
+
+    monkeypatch.setattr(db, "create_async_engine", fake_create_async_engine)
+    await db.create_database_if_not_exists(
+        MySQLSettings(
+            host="127.0.0.1",
+            port=3306,
+            user="root",
+            password="pw",
+            database="brand_new_db",
+        )
+    )
+
+    assert len(recorded) == 1
+    assert recorded[0].database is None
+    assert recorded[0].host == "127.0.0.1"
