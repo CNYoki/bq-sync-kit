@@ -114,7 +114,10 @@ def command_list(settings: KitSettings, args: argparse.Namespace) -> int:
             current_project = job.project_name
             print(f"[{current_project}]")
         print(f"  {job.job_name}")
-        print(f"    source_globs : {', '.join(job.source_globs)}")
+        print(
+            f"    source_globs : "
+            f"{', '.join(job.source_globs) or '(由 producer manifest 声明)'}"
+        )
         print(f"    root         : {job.root}")
         print(f"    target_table : {job.target_table}")
         print(
@@ -131,6 +134,13 @@ def command_list(settings: KitSettings, args: argparse.Namespace) -> int:
             f"    archive      : {job.archive_dir or '(不归档)'}"
             + (f" layout={job.archive_layout}" if job.archive_dir else "")
         )
+        if job.producer.enabled:
+            print(
+                f"    producer     : {job.producer.display} "
+                f"(manifest={'on' if job.producer.manifest else 'off'})"
+            )
+        if job.cleanup.enabled:
+            print(f"    cleanup      : {job.cleanup.display}")
     return 0
 
 
@@ -146,7 +156,7 @@ async def command_run(settings: KitSettings, args: argparse.Namespace) -> int:
     for job_summary in summary.jobs:
         logger.info(
             "%s: discovered=%d skipped=%d succeeded=%d failed=%d "
-            "archived=%d archive_failed=%d",
+            "archived=%d archive_failed=%d cleaned=%d cleanup_failed=%d",
             job_summary.qualified_name,
             job_summary.discovered,
             job_summary.skipped,
@@ -154,6 +164,8 @@ async def command_run(settings: KitSettings, args: argparse.Namespace) -> int:
             job_summary.failed,
             job_summary.archived,
             job_summary.archive_failed,
+            job_summary.cleaned,
+            job_summary.cleanup_failed,
         )
     logger.info("同步结束: %s", summary.format_line())
     return 0 if summary.ok else 1
@@ -185,6 +197,11 @@ async def command_status(settings: KitSettings, args: argparse.Namespace) -> int
         )
         if record["status"] == "failed" and record["error_message"]:
             print(f"           错误: {record['error_message']}")
+        if record.get("cleanup_status") in ("pending", "failed"):
+            print(
+                f"           清理未完成({record['cleanup_status']}): "
+                f"{record.get('cleanup_error') or record.get('cleanup_token') or ''}"
+            )
     return 0
 
 

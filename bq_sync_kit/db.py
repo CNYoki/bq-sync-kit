@@ -42,8 +42,10 @@ async def create_database_if_not_exists(settings: MySQLSettings) -> None:
     if not database or not url.get_backend_name().startswith("mysql"):
         return
 
+    # URL.set() 会忽略值为 None 的参数，拿它清库名是无效的——必须用 _replace，
+    # 否则这里会连上那个还不存在的库，直接 1049。
     server_engine = create_async_engine(
-        url.set(database=None), echo=settings.echo
+        url._replace(database=None), echo=settings.echo
     )
     try:
         async with server_engine.connect() as connection:

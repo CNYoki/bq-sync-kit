@@ -84,3 +84,54 @@ projects:
         target_table: aaa.raw_batch_out
         archive_dir: /data1/archive/
         archive_layout: date
+
+  # ---- 项目四：数据不在文件里，靠外挂脚本从 MySQL 导出 ----
+  - name: d
+    root: /home/work/d
+    project_id: ${D_GCP_PROJECT:-}
+    jobs:
+      - name: orders_drain
+        target_table: warehouse.orders
+        # producer 负责产出 JSONL 并回写 $BQ_SYNC_MANIFEST；退出码非 0 即视为失败。
+        producer:
+          command: ["python3", "scripts/mysql_drain.py", "--table", "orders"]
+          # cwd 默认是 root；env 会并进脚本的环境变量。
+          env:
+            MYSQL_DSN: ${ORDERS_MYSQL_DSN:-}
+          timeout_seconds: 1800
+          # true：按 manifest 声明的文件同步（推荐，能对账行数、显式给数据日期）。
+          # false：脚本只管把文件写进 source_glob 覆盖的位置，退回常规 glob 发现。
+          manifest: true
+          on_error: fail          # fail | skip
+          run_on_dry_run: false   # dry-run 默认不执行 producer
+        # cleanup 在 JSONL 通过校验并落库之后执行，用来删掉源端已导出的数据。
+        # 不配就不删。脚本必须可重复执行：崩溃后下一轮会拿同样的 token 重试。
+        cleanup:
+          command: ["python3", "scripts/mysql_drain.py", "--delete"]
+          env:
+            MYSQL_DSN: ${ORDERS_MYSQL_DSN:-}
+          timeout_seconds: 600
+        archive_dir: /data1/archive/
+        archive_layout: date
+
+      # 只导出、不删源端的表：没有 cleanup，就没有“源端还剩什么”可以界定下一轮的
+      # 范围，必须由脚本自己查状态表跳过已登记的 segment_date，否则每轮都会重导一遍。
+      # 见 scripts/douyin_creator_checkpoint_export.py。
+      - name: checkpoints_export
+        target_table: warehouse.checkpoints
+        producer:
+          command: ["python3", "scripts/checkpoints_export.py", "export"]
+          env:
+            MYSQL_DSN: ${CHECKPOINTS_MYSQL_DSN:-}
+        # 不配 cleanup 即表示不删源端。
+        archive_dir: /data1/archive/
+
+      # manifest: false 时产物走 glob 发现，此时若导出的是当天数据，
+      # 需要关掉“只同步早于今天的文件”这条过滤。
+      - name: events_drain
+        source_glob: export/events_*.jsonl
+        target_table: warehouse.events
+        require_past_date: false
+        producer:
+          command: "sh scripts/export_events.sh"
+          manifest: false

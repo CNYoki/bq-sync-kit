@@ -11,11 +11,15 @@ import logging
 from pathlib import Path
 from typing import Any, AsyncIterator, Sequence
 
-from sqlalchemy import MetaData, Table, select, text
+from sqlalchemy import MetaData, Table, inspect, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.schema import CreateColumn
 
 from bq_sync_kit.config import MySQLSettings
 from bq_sync_kit.models import (
+    CLEANUP_DONE,
+    CLEANUP_FAILED,
+    CLEANUP_PENDING,
     STATUS_FAILED,
     STATUS_SUCCESS,
     STATUS_UPLOADING,
@@ -63,6 +67,9 @@ class FileSyncMetadata:
     size: int
     sha256: str
     target_table: str
+    # 只有 producer 的 manifest 会填这两项。
+    expected_rows: int | None = None
+    cleanup_token: str = ""
 
     @property
     def file_key(self) -> str:
@@ -74,6 +81,8 @@ class SyncAttempt:
     job_id: str
     attempt_count: int
     resumed: bool
+    # 同一份文件之前已经清理过源端，就不要再执行一遍删除脚本。
+    cleanup_done: bool = False
 
 
 class SyncRepository:
@@ -107,8 +116,41 @@ class SyncRepository:
                 await create_database_if_not_exists(self.settings)
             self._engine = create_engine(self.settings)
         self._table = build_state_table(self.settings.state_table, self._metadata)
-        async with self._engine.begin() as connection:
-            await connection.run_sync(self._metadata.create_all, checkfirst=True)
+        # 建表和补列都要在锁内做：两台机器首次升级时同时启动的话，会各自看到同一
+        # 张缺列的老表并发出同样的 ADD COLUMN，后一个直接撞重复列错误、整个 run
+        # 崩在这里。这个锁和 run() 里按项目加的那个是两回事，只管 schema。
+        async with self.run_lock(f"schema:{self.settings.state_table}"):
+            async with self._engine.begin() as connection:
+                await connection.run_sync(
+                    self._metadata.create_all, checkfirst=True
+                )
+                await self._add_missing_columns(connection)
+
+    async def _add_missing_columns(self, connection: Any) -> None:
+        """给早于本版本创建的状态表补上新增的可空列。
+
+        create_all 只会建表，不会改表；升级后直接跑会因为缺列报错，所以这里做一次
+        最小的自动迁移。只补可空列，不动既有列。
+        """
+        table = self.table
+        existing = {
+            column["name"]
+            for column in await connection.run_sync(
+                lambda sync_connection: inspect(sync_connection).get_columns(
+                    table.name
+                )
+            )
+        }
+        dialect = connection.engine.dialect
+        quoted_table = dialect.identifier_preparer.format_table(table)
+        for column in table.columns:
+            if column.name in existing or not column.nullable:
+                continue
+            definition = CreateColumn(column).compile(dialect=dialect)
+            await connection.execute(
+                text(f"ALTER TABLE {quoted_table} ADD COLUMN {definition}")
+            )
+            logger.info("状态表补列: %s.%s", table.name, column.name)
 
     async def close(self) -> None:
         if self._engine is not None and self._owns_engine:
@@ -162,7 +204,9 @@ class SyncRepository:
             )
         return status == STATUS_SUCCESS
 
-    async def reserve_attempt(self, metadata: FileSyncMetadata) -> SyncAttempt:
+    async def reserve_attempt(
+        self, metadata: FileSyncMetadata, *, cleanup_required: bool = False
+    ) -> SyncAttempt:
         """登记一次上传尝试，返回本次使用的 BigQuery job ID。"""
         table = self.table
         async with self.engine.begin() as connection:
@@ -189,8 +233,15 @@ class SyncRepository:
                     job_id=record["bigquery_job_id"],
                     attempt_count=int(record["attempt_count"] or 0),
                     resumed=True,
+                    cleanup_done=record["cleanup_status"] == CLEANUP_DONE,
                 )
 
+            # 文件内容没变说明源端那批行已经删过了，保留 done 状态。
+            cleanup_done = (
+                record is not None
+                and record["cleanup_status"] == CLEANUP_DONE
+                and record["file_sha256"] == metadata.sha256
+            )
             now = datetime.now()
             attempt_count = (
                 1 if record is None else int(record["attempt_count"] or 0) + 1
@@ -215,6 +266,14 @@ class SyncRepository:
                 "error_message": None,
                 "started_at": now,
                 "synced_at": None,
+                "expected_rows": metadata.expected_rows,
+                "cleanup_token": metadata.cleanup_token or None,
+                "cleanup_status": (
+                    CLEANUP_DONE
+                    if cleanup_done
+                    else (CLEANUP_PENDING if cleanup_required else None)
+                ),
+                "cleanup_error": None,
             }
             if record is None:
                 await connection.execute(
@@ -232,7 +291,10 @@ class SyncRepository:
                     .values(**values)
                 )
         return SyncAttempt(
-            job_id=job_id, attempt_count=attempt_count, resumed=False
+            job_id=job_id,
+            attempt_count=attempt_count,
+            resumed=False,
+            cleanup_done=cleanup_done,
         )
 
     async def mark_success(
@@ -308,6 +370,106 @@ class SyncRepository:
             )
             if result.rowcount == 0:
                 raise RuntimeError(f"同步记录不存在: {metadata.path}")
+
+    async def set_cleanup_status(
+        self,
+        project_name: str,
+        job_name: str,
+        file_key: str,
+        *,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        table = self.table
+        async with self.engine.begin() as connection:
+            await connection.execute(
+                table.update()
+                .where(
+                    table.c.project_name == project_name,
+                    table.c.job_name == job_name,
+                    table.c.file_key == file_key,
+                )
+                .values(
+                    cleanup_status=status,
+                    cleanup_error=(
+                        error_message[:4000] if error_message else None
+                    ),
+                )
+            )
+
+    async def unfinished_cleanups(
+        self, project_name: str, job_name: str
+    ) -> list[dict[str, Any]]:
+        """还没清理干净的记录。
+
+        只要存在这样的记录，就说明源端还留着已经导出过的数据，此时绝不能再跑
+        producer——否则同一批数据会被导出第二遍，在 BigQuery 里变成重复行。
+        """
+        table = self.table
+        query = (
+            select(table)
+            .where(
+                table.c.project_name == project_name,
+                table.c.job_name == job_name,
+                or_(
+                    table.c.cleanup_status == CLEANUP_PENDING,
+                    table.c.cleanup_status == CLEANUP_FAILED,
+                ),
+            )
+            .order_by(table.c.id)
+        )
+        async with self.engine.connect() as connection:
+            rows = (await connection.execute(query)).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def retryable_records(
+        self, project_name: str, job_name: str
+    ) -> list[dict[str, Any]]:
+        """还没成功进仓的记录。
+
+        producer 的 manifest 只描述本轮产出，上一轮失败的文件不会再出现在里面；
+        源端的行却可能已经删了，所以必须从状态表里把它们捞回来重试。
+        """
+        table = self.table
+        query = (
+            select(table)
+            .where(
+                table.c.project_name == project_name,
+                table.c.job_name == job_name,
+                table.c.status.in_([STATUS_UPLOADING, STATUS_FAILED]),
+            )
+            .order_by(table.c.segment_date, table.c.id)
+        )
+        async with self.engine.connect() as connection:
+            rows = (await connection.execute(query)).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def unarchived_records(
+        self, project_name: str, job_name: str
+    ) -> list[dict[str, Any]]:
+        """已经成功进仓、却还没归档成功的记录。
+
+        普通 glob 发现能靠再次扫到文件来补做归档；manifest 模式下 producer 只描述
+        本轮产出，上一轮归档失败的文件不会再出现在里面，不从状态表捞回来就会永远
+        留在源目录里。
+        """
+        table = self.table
+        query = (
+            select(table)
+            .where(
+                table.c.project_name == project_name,
+                table.c.job_name == job_name,
+                table.c.status == STATUS_SUCCESS,
+                or_(
+                    table.c.archived_path.is_(None),
+                    table.c.archived_path == "",
+                ),
+            )
+            .order_by(table.c.segment_date, table.c.id)
+        )
+        async with self.engine.connect() as connection:
+            rows = (await connection.execute(query)).mappings().all()
+        return [dict(row) for row in rows]
 
     async def recent_records(
         self,
