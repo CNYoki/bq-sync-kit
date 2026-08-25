@@ -50,7 +50,9 @@ bq_sync_kit/            the package itself
 └── notifier.py         failure notifications
 scripts/
 ├── bq_sync.sh          cron wrapper: flock, .env loading, logging, log rotation
-└── crontab.example     sample schedule
+├── crontab.example     sample schedule
+├── user_live_visits_drain.py           producer + cleanup for a drained MySQL table
+└── douyin_creator_checkpoint_export.py producer for an export-only MySQL table
 tests/                  pytest suite
 config.example.yaml     annotated reference config
 .env.example            secrets template
@@ -220,6 +222,24 @@ Cleanup runs after the file has passed its checks and MySQL holds a durable "thi
 loaded" record — not after the BigQuery load. **Cleanup scripts must be safe to run twice**: if the
 process dies mid-way, the next run retries with the same token. `DELETE ... WHERE id BETWEEN a AND b`
 is naturally idempotent; `DELETE ... LIMIT n` is not.
+
+#### Export-only sources
+
+A source that must keep its rows — a crawler's checkpoint table, say — gets a producer and no
+cleanup. Nothing on the source side then records what has already been exported, so re-scanning the
+same window every round would append the same rows again. Let the state table answer instead: query
+`bq_file_sync_record` for the `segment_date` values already registered under this
+`project_name` / `job_name` and skip those days. Include every status, not just `success` —
+`uploading` and `failed` files are still on disk and are retried from the state table by the kit
+itself, so exporting them a second time only creates duplicates.
+
+Such a job must still stop at the day boundary (`updated_at < today`). Exporting a day that is
+still being written registers it in the state table, and every row that lands in that day afterwards
+is then skipped forever.
+
+`scripts/douyin_creator_checkpoint_export.py` implements this pattern;
+`scripts/user_live_visits_drain.py` is the drain counterpart, where deletion is what bounds the
+next round.
 
 ### Archiving
 

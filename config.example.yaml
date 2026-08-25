@@ -114,6 +114,18 @@ projects:
         archive_dir: /data1/archive/
         archive_layout: date
 
+      # 只导出、不删源端的表：没有 cleanup，就没有“源端还剩什么”可以界定下一轮的
+      # 范围，必须由脚本自己查状态表跳过已登记的 segment_date，否则每轮都会重导一遍。
+      # 见 scripts/douyin_creator_checkpoint_export.py。
+      - name: checkpoints_export
+        target_table: warehouse.checkpoints
+        producer:
+          command: ["python3", "scripts/checkpoints_export.py", "export"]
+          env:
+            MYSQL_DSN: ${CHECKPOINTS_MYSQL_DSN:-}
+        # 不配 cleanup 即表示不删源端。
+        archive_dir: /data1/archive/
+
       # manifest: false 时产物走 glob 发现，此时若导出的是当天数据，
       # 需要关掉“只同步早于今天的文件”这条过滤。
       - name: events_drain
