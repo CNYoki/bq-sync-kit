@@ -260,3 +260,13 @@ def test_cleanup_on_an_already_empty_day_is_a_no_op(monkeypatch):
     )
     assert asyncio.run(drain.command_cleanup(args)) == 0
     assert len(connection.queries) == 1
+
+
+@pytest.mark.parametrize("command", ["export", "cleanup"])
+@pytest.mark.parametrize("size", ["0", "-1"])
+def test_a_non_positive_batch_size_is_refused(command, size, monkeypatch):
+    """cleanup 里 LIMIT 0 会删到 0 行然后正常退出，kit 于是把 cleanup 记成 done。"""
+    monkeypatch.setenv("LIVE_VISITS_MYSQL_DSN", "mysql://u:p@h:3306/db")
+    monkeypatch.setenv("BQ_SYNC_CLEANUP_TOKEN", drain.build_token(date(2026, 8, 24)))
+    with pytest.raises(SystemExit):
+        drain.main([command, "--batch-size", size])

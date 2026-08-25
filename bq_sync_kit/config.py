@@ -618,6 +618,22 @@ def _build_job(
     if not root.is_absolute():
         root = (base_dir / root).resolve()
 
+    bigquery = _build_bigquery(resolved, where)
+    if cleanup.enabled:
+        # cleanup 在 load 之前执行，靠的是“文件已完整收下”这个前提。放宽 load
+        # 的容错就把这个前提拆了：BigQuery 会丢掉坏行仍然报成功，而源端那批行
+        # 已经删了，丢掉的部分再也找不回来。
+        if bigquery.max_bad_records > 0:
+            raise ConfigError(
+                f"{where}: 配了 cleanup 就不能同时设 max_bad_records > 0——"
+                "源端数据在 load 之前就删了，BigQuery 丢掉的坏行无法补回"
+            )
+        if bigquery.ignore_unknown_values:
+            raise ConfigError(
+                f"{where}: 配了 cleanup 就不能同时设 ignore_unknown_values——"
+                "源端数据在 load 之前就删了，被忽略的字段无法补回"
+            )
+
     return SyncJob(
         project_name=project_name,
         job_name=job_name,
@@ -634,7 +650,7 @@ def _build_job(
             resolved["skip_empty_files"], f"{where}.skip_empty_files"
         ),
         timezone=str(resolved["timezone"]).strip() or "UTC",
-        bigquery=_build_bigquery(resolved, where),
+        bigquery=bigquery,
         notification=NotificationSettings.from_mapping(
             resolved.get("notification")
         ),

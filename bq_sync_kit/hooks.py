@@ -17,10 +17,12 @@ import json
 import logging
 import os
 from pathlib import Path
+import signal
 import tempfile
 from typing import Any, Iterator, Mapping
 
-from bq_sync_kit.config import HookSettings, SyncJob
+from bq_sync_kit.config import HookSettings, MySQLSettings, SyncJob
+from bq_sync_kit.db import build_url
 from bq_sync_kit.discovery import DiscoveredFile, extract_segment_date, resolve_path
 
 logger = logging.getLogger(__name__)
@@ -79,29 +81,36 @@ async def run_hook(
     environ.update(env or {})
 
     logger.info("%s: 执行 %s (cwd=%s)", label, hook.display, cwd)
-    if hook.shell:
-        process = await asyncio.create_subprocess_shell(
-            hook.command_line,
-            cwd=str(cwd),
-            env=environ,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    else:
-        process = await asyncio.create_subprocess_exec(
-            *hook.command,
-            cwd=str(cwd),
-            env=environ,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+    # start_new_session 把钩子放进独立的进程组：超时后要连它派生的子进程一起收掉，
+    # 只 kill 直接子进程的话，shell 钩子真正干活的那个进程会活下来，在锁已经释放
+    # 之后继续改源端数据。
+    spawn_kwargs = {
+        "cwd": str(cwd),
+        "env": environ,
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+        "start_new_session": True,
+    }
+    try:
+        if hook.shell:
+            process = await asyncio.create_subprocess_shell(
+                hook.command_line, **spawn_kwargs
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                *hook.command, **spawn_kwargs
+            )
+    except OSError as exc:
+        # 命令不存在、没有执行权限等等。不包成 HookError 的话，调用方接不住，
+        # on_error / 失败通知全被绕过，整个 run 会直接挂掉。
+        raise HookError(f"{label}: 无法启动 {hook.display}: {exc}") from exc
 
     try:
         raw_stdout, raw_stderr = await asyncio.wait_for(
             process.communicate(), timeout=hook.timeout_seconds
         )
     except asyncio.TimeoutError:
-        process.kill()
+        _kill_process_tree(process, label=label)
         await process.wait()
         raise HookError(
             f"{label}: 执行超时 ({hook.timeout_seconds}s): {hook.display}"
@@ -122,6 +131,18 @@ async def run_hook(
     return HookResult(
         returncode=process.returncode or 0, stdout=stdout, stderr=stderr
     )
+
+
+def _kill_process_tree(process: Any, *, label: str) -> None:
+    """收掉整个进程组；组已经不在了就退回只 kill 直接子进程。"""
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        logger.warning("%s: 无法结束进程组，改为结束主进程: %s", label, exc)
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
 
 
 def _entry_error(where: str, index: int, message: str) -> HookError:
@@ -239,9 +260,14 @@ def parse_manifest(path: Path, *, job: SyncJob) -> list[DiscoveredFile]:
 
 
 def producer_env(
-    job: SyncJob, *, manifest_path: Path, today: date, dry_run: bool
+    job: SyncJob,
+    *,
+    manifest_path: Path,
+    today: date,
+    dry_run: bool,
+    mysql: MySQLSettings | None = None,
 ) -> dict[str, str]:
-    return {
+    environ = {
         "BQ_SYNC_MANIFEST": str(manifest_path),
         "BQ_SYNC_PROJECT": job.project_name,
         "BQ_SYNC_JOB": job.job_name,
@@ -251,6 +277,15 @@ def producer_env(
         "BQ_SYNC_BOUNDARY_DATE": today.isoformat(),
         "BQ_SYNC_DRY_RUN": "1" if dry_run else "0",
     }
+    if mysql is not None:
+        # 没有 cleanup 的 producer 只能靠状态表判断哪些数据已经导过，所以得知道
+        # 状态库在哪。默认让它去连源库是错的：两者不同库时那张表根本查不到，
+        # 跳过集为空，同一批数据每轮重导一遍。
+        environ["BQ_SYNC_STATE_DSN"] = build_url(mysql).render_as_string(
+            hide_password=False
+        )
+        environ["BQ_SYNC_STATE_TABLE"] = mysql.state_table
+    return environ
 
 
 def cleanup_env(
@@ -277,7 +312,11 @@ def cleanup_env(
 
 
 async def run_producer(
-    job: SyncJob, *, today: date, dry_run: bool = False
+    job: SyncJob,
+    *,
+    today: date,
+    dry_run: bool = False,
+    mysql: MySQLSettings | None = None,
 ) -> list[DiscoveredFile] | None:
     """跑 producer 脚本。
 
@@ -291,7 +330,11 @@ async def run_producer(
             root=job.root,
             label=label,
             env=producer_env(
-                job, manifest_path=manifest_path, today=today, dry_run=dry_run
+                job,
+                manifest_path=manifest_path,
+                today=today,
+                dry_run=dry_run,
+                mysql=mysql,
             ),
         )
         if not job.producer.manifest:

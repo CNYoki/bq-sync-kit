@@ -228,20 +228,19 @@ def test_exported_dates_come_from_the_state_table():
     assert args == ("p", "j")
 
 
-def test_a_missing_state_table_means_nothing_was_exported():
+def test_a_missing_state_table_is_fatal():
+    """查不到状态表说明连错了库；当成"没导过"会把全部历史日期重导一遍。"""
     connection = FakeConnection([[(0,)]])
 
-    dates = asyncio.run(
-        export.fetch_exported_dates(
-            connection,
-            state_table="bq_file_sync_record",
-            project_name="p",
-            job_name="j",
+    with pytest.raises(SystemExit):
+        asyncio.run(
+            export.fetch_exported_dates(
+                connection,
+                state_table="bq_file_sync_record",
+                project_name="p",
+                job_name="j",
+            )
         )
-    )
-
-    assert dates == set()
-    assert len(connection.queries) == 1
 
 
 @pytest.mark.parametrize("name", ["", "bq record", "a;DROP", "`x`"])
@@ -367,3 +366,39 @@ def test_out_dir_is_resolved_against_the_kit_root(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("BQ_SYNC_ROOT", str(tmp_path))
     assert export._resolve_out_dir("data/jsonl") == tmp_path / "data" / "jsonl"
     assert export._resolve_out_dir("/abs/dir") == Path("/abs/dir")
+
+
+@pytest.mark.parametrize("size", ["0", "-1"])
+def test_a_non_positive_batch_size_is_refused(size, monkeypatch):
+    # LIMIT 0 让每一天都读成空的，脚本删掉空文件后正常退出——一次静默空转。
+    monkeypatch.setenv("CREATOR_CHECKPOINT_MYSQL_DSN", "mysql://u:p@h:3306/db")
+    monkeypatch.setenv("BQ_SYNC_PROJECT", "p")
+    monkeypatch.setenv("BQ_SYNC_JOB", "j")
+    with pytest.raises(SystemExit):
+        export.main(["export", "--batch-size", size])
+
+
+def test_state_dsn_defaults_to_the_kit_state_database(monkeypatch, tmp_path: Path):
+    """kit 注入的 $BQ_SYNC_STATE_DSN 要优先于源库 DSN。"""
+    monkeypatch.setenv("BQ_SYNC_STATE_DSN", "mysql://u:p@state:3306/bq_sync")
+    monkeypatch.setenv("BQ_SYNC_STATE_TABLE", "custom_record")
+    monkeypatch.setenv("CREATOR_CHECKPOINT_MYSQL_DSN", "mysql://u:p@src:3306/src")
+    args = export.build_parser().parse_args(["export"])
+    assert args.state_dsn == "mysql://u:p@state:3306/bq_sync"
+    assert args.state_table == "custom_record"
+
+
+def test_the_state_connection_uses_the_state_dsn(tmp_path: Path, monkeypatch):
+    seen: list[str] = []
+    state = FakeConnection([[(1,)], []])
+    source = FakeConnection([[]])
+    queue = deque([state, source])
+
+    async def fake_connect(dsn: str):
+        seen.append(dsn)
+        return queue.popleft()
+
+    monkeypatch.setattr(export, "connect", fake_connect)
+    args = _export_args(tmp_path, state_dsn="mysql://u:p@state:3306/bq_sync")
+    assert asyncio.run(export.command_export(args)) == 0
+    assert seen == ["mysql://u:p@state:3306/bq_sync", "mysql://u:p@h:3306/db"]

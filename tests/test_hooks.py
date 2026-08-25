@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from pathlib import Path
 import stat
@@ -10,8 +11,8 @@ import stat
 import pytest
 
 from bq_sync_kit.bigquery_loader import LoadResult
-from bq_sync_kit.config import ConfigError, build_settings
-from bq_sync_kit.hooks import HookError, parse_manifest
+from bq_sync_kit.config import ConfigError, HookSettings, build_settings
+from bq_sync_kit.hooks import HookError, parse_manifest, producer_env, run_hook
 from bq_sync_kit.notifier import FailureNotifier
 from bq_sync_kit.repository import SyncRepository
 from bq_sync_kit.sync import SyncRunner
@@ -367,3 +368,169 @@ touch "{once}"
     assert summary.succeeded == 1
     assert loader.calls[0]["path"].name == "orders_2026-08-23.jsonl"
     assert (tmp_path / "cleanup.log").read_text().count("id:1..2") == 1
+
+
+async def test_a_missing_executable_becomes_a_hook_error(tmp_path, base_document):
+    """裸的 FileNotFoundError 调用方接不住，会把整个 run 带崩。"""
+    job = build_settings(base_document).projects[0].jobs[0]
+    hook = HookSettings.from_mapping(
+        {"command": [str(tmp_path / "does-not-exist")]}, where="j.producer"
+    )
+    with pytest.raises(HookError, match="无法启动"):
+        await run_hook(hook, root=job.root, label="j producer")
+
+
+async def test_a_non_executable_file_becomes_a_hook_error(tmp_path, base_document):
+    target = tmp_path / "not-executable.sh"
+    target.write_text("#!/bin/sh\ntrue\n", encoding="utf-8")
+    target.chmod(0o644)
+    job = build_settings(base_document).projects[0].jobs[0]
+    hook = HookSettings.from_mapping({"command": [str(target)]}, where="j.producer")
+    with pytest.raises(HookError, match="无法启动"):
+        await run_hook(hook, root=job.root, label="j producer")
+
+
+async def test_a_missing_producer_honours_on_error_skip(tmp_path, base_document):
+    """启动失败也要走 on_error，而不是把异常抛穿整个 run。"""
+    base_document["projects"][0]["jobs"][0]["producer"] = {
+        "command": [str(tmp_path / "does-not-exist")],
+        "on_error": "skip",
+    }
+    runner = make_runner(base_document, FakeLoader(), RecordingNotifier())
+    summary = await runner.run(boundary_date=BOUNDARY)
+    assert summary.failed == 0 and summary.discovered == 0
+
+
+async def test_a_missing_producer_is_reported_not_raised(tmp_path, base_document):
+    base_document["projects"][0]["jobs"][0]["producer"] = {
+        "command": [str(tmp_path / "does-not-exist")]
+    }
+    notifier = RecordingNotifier()
+    runner = make_runner(base_document, FakeLoader(), notifier)
+    summary = await runner.run(boundary_date=BOUNDARY)
+    assert summary.failed == 1 and not summary.ok
+    assert "producer 执行失败" in notifier.messages[0][0]
+
+
+async def test_a_timed_out_hook_takes_its_children_with_it(tmp_path, base_document):
+    """只 kill 直接子进程的话，shell 派生的那个会活到锁释放之后。"""
+    marker = tmp_path / "child-alive"
+    write_script(
+        tmp_path / "slow.sh",
+        f'(sleep 30; echo alive > "{marker}") &\nsleep 30\n',
+    )
+    job = build_settings(base_document).projects[0].jobs[0]
+    hook = HookSettings.from_mapping(
+        {"command": ["sh", str(tmp_path / "slow.sh")], "timeout_seconds": 0.5},
+        where="j.producer",
+    )
+    with pytest.raises(HookError, match="执行超时"):
+        await run_hook(hook, root=job.root, label="j producer")
+
+    await asyncio.sleep(1.5)
+    assert not marker.exists()
+
+
+def test_producer_env_carries_the_state_database(tmp_path, base_document):
+    """没有 cleanup 的 producer 只能靠状态表判断哪些数据导过。"""
+    settings = build_settings(base_document)
+    job = settings.projects[0].jobs[0]
+    environ = producer_env(
+        job,
+        manifest_path=tmp_path / "m.json",
+        today=BOUNDARY,
+        dry_run=False,
+        mysql=settings.mysql,
+    )
+    assert environ["BQ_SYNC_STATE_TABLE"] == "bq_file_sync_record"
+    assert "sqlite" in environ["BQ_SYNC_STATE_DSN"]
+
+
+def test_producer_env_omits_the_state_database_when_unknown(tmp_path, base_document):
+    job = build_settings(base_document).projects[0].jobs[0]
+    environ = producer_env(
+        job, manifest_path=tmp_path / "m.json", today=BOUNDARY, dry_run=False
+    )
+    assert "BQ_SYNC_STATE_DSN" not in environ
+
+
+async def test_the_producer_receives_the_state_database(tmp_path, base_document):
+    write_script(
+        tmp_path / "producer.sh",
+        f'echo "$BQ_SYNC_STATE_TABLE" > "{tmp_path / "state.log"}"\n'
+        f'echo \'{{"files": []}}\' > "$BQ_SYNC_MANIFEST"\n',
+    )
+    base_document["projects"][0]["jobs"][0]["producer"] = {
+        "command": ["sh", str(tmp_path / "producer.sh")]
+    }
+    await make_runner(base_document, FakeLoader(), RecordingNotifier()).run(
+        boundary_date=BOUNDARY
+    )
+    assert (tmp_path / "state.log").read_text().strip() == "bq_file_sync_record"
+
+
+def test_cleanup_rejects_permissive_load_settings(base_document):
+    """源端在 load 之前就删了，BigQuery 丢掉的坏行补不回来。"""
+    job = base_document["projects"][0]["jobs"][0]
+    job["cleanup"] = {"command": ["true"]}
+    job["max_bad_records"] = 5
+    with pytest.raises(ConfigError, match="max_bad_records"):
+        build_settings(base_document)
+
+
+def test_cleanup_rejects_ignore_unknown_values(base_document):
+    job = base_document["projects"][0]["jobs"][0]
+    job["cleanup"] = {"command": ["true"]}
+    job["ignore_unknown_values"] = True
+    with pytest.raises(ConfigError, match="ignore_unknown_values"):
+        build_settings(base_document)
+
+
+def test_permissive_load_settings_are_fine_without_cleanup(base_document):
+    base_document["projects"][0]["jobs"][0]["max_bad_records"] = 5
+    assert build_settings(base_document).projects[0].jobs[0].bigquery.max_bad_records == 5
+
+
+async def test_a_failed_archive_is_retried_in_manifest_mode(
+    tmp_path, producer_document
+):
+    """producer 下一轮不会再提到这个文件，不从状态表捞回来它就永远留在源目录。"""
+    once = tmp_path / "produced_once"
+    write_script(
+        tmp_path / "producer.sh",
+        f'''set -e
+if [ -f "{once}" ]; then
+  echo '{{"files": []}}' > "$BQ_SYNC_MANIFEST"
+  exit 0
+fi
+touch "{once}"
+mkdir -p "$BQ_SYNC_ROOT/data"
+printf '{{"id":1}}\\n{{"id":2}}\\n' > "$BQ_SYNC_ROOT/data/orders_2026-08-23.jsonl"
+cat > "$BQ_SYNC_MANIFEST" <<'MANIFEST'
+{{"files": [{{"path": "data/orders_2026-08-23.jsonl",
+             "segment_date": "2026-08-23", "rows": 2}}]}}
+MANIFEST
+''',
+    )
+    # 归档目录位置放了个普通文件，第一轮 mkdir 必然失败。
+    blocker = tmp_path / "archive"
+    blocker.write_text("not a directory", encoding="utf-8")
+    job = producer_document["projects"][0]["jobs"][0]
+    job["archive_dir"] = str(blocker)
+    job.pop("cleanup", None)
+
+    first = await make_runner(
+        producer_document, FakeLoader(), RecordingNotifier()
+    ).run(boundary_date=BOUNDARY)
+    assert (first.succeeded, first.archived, first.archive_failed) == (1, 0, 1)
+    source = tmp_path / "data" / "orders_2026-08-23.jsonl"
+    assert source.is_file()
+
+    blocker.unlink()
+    second = await make_runner(
+        producer_document, FakeLoader(), RecordingNotifier()
+    ).run(boundary_date=BOUNDARY)
+
+    assert (second.skipped, second.archived, second.archive_failed) == (1, 1, 0)
+    assert not source.exists()
+    assert (blocker / "orders_2026-08-23.jsonl").is_file()

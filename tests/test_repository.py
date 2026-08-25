@@ -127,3 +127,28 @@ async def test_create_database_connects_without_the_target_database(monkeypatch)
     assert len(recorded) == 1
     assert recorded[0].database is None
     assert recorded[0].host == "127.0.0.1"
+
+
+async def test_schema_setup_runs_under_a_lock(sqlite_mysql_settings):
+    """两台机器首次升级会同时 ADD COLUMN，后一个撞重复列错误。"""
+    from contextlib import asynccontextmanager
+
+    from bq_sync_kit.config import MySQLSettings
+
+    scopes: list[str] = []
+    repo = SyncRepository(MySQLSettings.from_mapping(sqlite_mysql_settings))
+    original = repo.run_lock
+
+    @asynccontextmanager
+    async def recording(scope: str):
+        scopes.append(scope)
+        async with original(scope):
+            yield
+
+    repo.run_lock = recording
+    try:
+        await repo.initialize()
+    finally:
+        await repo.close()
+
+    assert scopes == ["schema:bq_file_sync_record"]

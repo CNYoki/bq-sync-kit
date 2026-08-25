@@ -205,8 +205,14 @@ async def fetch_exported_dates(
         (state_table,),
     )
     if not exists or not exists[0][0]:
-        logger.warning("状态表 %s 还不存在，视作还没导过任何日期", state_table)
-        return set()
+        # kit 会在跑 producer 之前建好状态表，所以查不到只可能是连错了库——
+        # 多半是状态库和源库不在一起而 --state-dsn 没配。这时候返回空集合等于
+        # 放开全部历史日期重导一遍，宁可停下来。
+        raise SystemExit(
+            f"状态库 {state_table} 里找不到状态表：这个 job 靠它判断哪些日期已经"
+            "导过，查不到就会重复导出。请用 --state-dsn 指向 kit 的状态库"
+            "（或设 $BQ_SYNC_STATE_DSN）"
+        )
 
     rows = await _fetch(
         connection,
@@ -468,12 +474,13 @@ def build_parser() -> argparse.ArgumentParser:
     state.add_argument(
         "--state-dsn",
         default=os.environ.get("BQ_SYNC_STATE_DSN", ""),
-        help="状态库 DSN，默认与 --dsn 同库",
+        help="状态库 DSN，默认取 $BQ_SYNC_STATE_DSN（由 kit 注入），"
+        "都没有时退回 --dsn",
     )
     state.add_argument(
         "--state-table",
         default=os.environ.get("BQ_SYNC_STATE_TABLE")
-        or DEFAULT_STATE_TABLE,
+        or DEFAULT_STATE_TABLE,  # kit 会注入 $BQ_SYNC_STATE_TABLE
         help=f"状态表名（默认 {DEFAULT_STATE_TABLE}）",
     )
     state.add_argument(
@@ -506,6 +513,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "缺少 DSN：用 --dsn 或设置 $CREATOR_CHECKPOINT_MYSQL_DSN"
         )
+    if getattr(args, "batch_size", 1) < 1:
+        # LIMIT 0 会让每一天都读成空的，脚本删掉空文件后正常退出——一次静默空转。
+        raise SystemExit("--batch-size 必须大于 0")
     if args.record_check and not (args.project and args.job):
         # 缺了这两个就没法定位状态表里的记录，静默跳过检查会导致每轮重复导出。
         raise SystemExit(

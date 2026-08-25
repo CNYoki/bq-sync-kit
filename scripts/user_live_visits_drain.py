@@ -392,6 +392,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not args.dsn:
         raise SystemExit("缺少 DSN：用 --dsn 或设置 $LIVE_VISITS_MYSQL_DSN")
+    if args.batch_size < 1:
+        # cleanup 里 LIMIT 0 会删到 0 行然后正常退出，kit 于是把 cleanup 记成
+        # done——源端一行没删，那一天从此卡死。
+        raise SystemExit("--batch-size 必须大于 0")
     if args.command == "export":
         return asyncio.run(command_export(args))
     return asyncio.run(command_cleanup(args))

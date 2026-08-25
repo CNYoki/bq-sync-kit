@@ -151,9 +151,28 @@ class SyncRunner:
             return SyncSummary()
 
         if dry_run:
-            return await self._report_dry_run(
-                selected, boundary_date=boundary_date, limit_per_job=limit_per_job
+            # run_on_dry_run 的 producer 一样会改源端数据，必须和正式跑一样受锁
+            # 保护，否则两台机器会在 dry-run 里各导一份。
+            needs_lock = any(
+                job.producer.enabled and job.producer.run_on_dry_run
+                for job in selected
             )
+            if not needs_lock:
+                return await self._report_dry_run(
+                    selected,
+                    boundary_date=boundary_date,
+                    limit_per_job=limit_per_job,
+                )
+            await self.repository.initialize()
+            try:
+                return await self._report_dry_run(
+                    selected,
+                    boundary_date=boundary_date,
+                    limit_per_job=limit_per_job,
+                    with_lock=True,
+                )
+            finally:
+                await self.repository.close()
 
         summary = SyncSummary()
         await self.repository.initialize()
@@ -222,7 +241,9 @@ class SyncRunner:
 
         if job.producer.enabled:
             try:
-                produced = await run_producer(job, today=today)
+                produced = await run_producer(
+                    job, today=today, mysql=self.settings.mysql
+                )
             except HookError as exc:
                 if job.producer.on_error == "skip":
                     logger.warning("%s: producer 失败，已跳过: %s",
@@ -259,7 +280,7 @@ class SyncRunner:
     async def _with_retryable(
         self, job: SyncJob, produced: Sequence[DiscoveredFile]
     ) -> list[DiscoveredFile]:
-        """把状态表里还没成功进仓的文件并进本轮产物一起重试。"""
+        """把状态表里还没处理完的文件并进本轮产物一起重试。"""
         files = {file.path: file for file in produced}
         for record in await self.repository.retryable_records(
             job.project_name, job.job_name
@@ -284,6 +305,27 @@ class SyncRunner:
                 target_table=record["target_table"],
                 cleanup_token=record["cleanup_token"] or "",
             )
+
+        if job.archive_dir:
+            # 已进仓但归档失败的文件：_run_job 会认出它已经 success 并只补做归档。
+            # 不捞回来的话，producer 下一轮不会再提到它，它就永远留在源目录里。
+            for record in await self.repository.unarchived_records(
+                job.project_name, job.job_name
+            ):
+                path = Path(record["file_path"])
+                if path in files or not path.is_file():
+                    continue
+                logger.info(
+                    "%s: 补做上一轮失败的归档: %s", job.qualified_name, path
+                )
+                files[path] = DiscoveredFile(
+                    path=path,
+                    segment_date=record["segment_date"],
+                    size=record["file_size"],
+                    expected_rows=record["expected_rows"],
+                    target_table=record["target_table"],
+                    cleanup_token=record["cleanup_token"] or "",
+                )
         return sorted(
             files.values(), key=lambda item: (item.segment_date, str(item.path))
         )
@@ -373,8 +415,40 @@ class SyncRunner:
         *,
         boundary_date: date | None,
         limit_per_job: int | None,
+        with_lock: bool = False,
     ) -> SyncSummary:
         summary = SyncSummary()
+        if with_lock:
+            for project_name in dict.fromkeys(
+                job.project_name for job in selected
+            ):
+                project_jobs = [
+                    job for job in selected if job.project_name == project_name
+                ]
+                async with self.repository.run_lock(project_name):
+                    await self._dry_run_jobs(
+                        project_jobs,
+                        boundary_date=boundary_date,
+                        limit_per_job=limit_per_job,
+                        summary=summary,
+                    )
+            return summary
+        await self._dry_run_jobs(
+            selected,
+            boundary_date=boundary_date,
+            limit_per_job=limit_per_job,
+            summary=summary,
+        )
+        return summary
+
+    async def _dry_run_jobs(
+        self,
+        selected: Sequence[SyncJob],
+        *,
+        boundary_date: date | None,
+        limit_per_job: int | None,
+        summary: SyncSummary,
+    ) -> None:
         for job in selected:
             today = boundary_date or self.today_for(job)
             job_summary = JobSummary(
@@ -385,7 +459,12 @@ class SyncRunner:
             files: list[DiscoveredFile] | None = None
             if job.producer.enabled:
                 if job.producer.run_on_dry_run:
-                    files = await run_producer(job, today=today, dry_run=True)
+                    files = await run_producer(
+                        job,
+                        today=today,
+                        dry_run=True,
+                        mysql=self.settings.mysql,
+                    )
                 else:
                     # producer 会改动源端数据，dry-run 默认不碰它。
                     logger.info(
@@ -411,7 +490,6 @@ class SyncRunner:
                     job.archive_dir or "(不归档)",
                     job.cleanup.display or "(不清理)",
                 )
-        return summary
 
     async def _run_job(
         self,

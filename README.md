@@ -186,6 +186,12 @@ An empty `cleanup.command` means nothing is deleted.
 | `BQ_SYNC_TIMEZONE` | The job's timezone |
 | `BQ_SYNC_BOUNDARY_DATE` | The date being treated as "today" |
 | `BQ_SYNC_DRY_RUN` | `1` when the run is a dry run |
+| `BQ_SYNC_STATE_DSN` | DSN of the kit's own state database |
+| `BQ_SYNC_STATE_TABLE` | Name of the state table inside it |
+
+The last two matter to export-only producers, which have to read the state table
+themselves — see below. Do not assume the state database is the same one the
+export reads from; it usually is not.
 
 #### The manifest
 
@@ -209,6 +215,11 @@ and a mismatch fails the file **without running cleanup**. A truncated export is
 that would silently lose data, and this is what catches it. The count comes from the same pass that
 computes the sha256, so it costs no extra I/O.
 
+Hooks run in their own process group and the whole group is killed on timeout, so
+a shell hook cannot leave children behind still writing to the source. A hook that
+cannot be started at all — missing file, not executable — is reported the same way
+as one that exits non-zero, and so honours `on_error`.
+
 Set `manifest: false` if the script would rather just drop files where `source_glob` can find them.
 In that mode the normal scan applies, including the "data date earlier than today" filter — set
 `require_past_date: false` when the export covers today's rows.
@@ -221,15 +232,26 @@ In that mode the normal scan applies, including the "data date earlier than toda
 Cleanup runs after the file has passed its checks and MySQL holds a durable "this file must be
 loaded" record — not after the BigQuery load. **Cleanup scripts must be safe to run twice**: if the
 process dies mid-way, the next run retries with the same token. `DELETE ... WHERE id BETWEEN a AND b`
-is naturally idempotent; `DELETE ... LIMIT n` is not.
+is naturally idempotent; `DELETE ... LIMIT n` is not. A cleanup that exits 0
+without deleting anything is recorded as done, so validate your own arguments —
+a batch size of zero turns the whole contract into a silent no-op.
+
+Because cleanup runs before the load, a job that configures it may not also relax
+the load: `max_bad_records > 0` and `ignore_unknown_values: true` are rejected at
+config time. Both let BigQuery report success while dropping data that no longer
+exists at the source.
 
 #### Export-only sources
 
 A source that must keep its rows — a crawler's checkpoint table, say — gets a producer and no
 cleanup. Nothing on the source side then records what has already been exported, so re-scanning the
-same window every round would append the same rows again. Let the state table answer instead: query
-`bq_file_sync_record` for the `segment_date` values already registered under this
-`project_name` / `job_name` and skip those days. Include every status, not just `success` —
+same window every round would append the same rows again. Let the state table answer instead: connect
+with `BQ_SYNC_STATE_DSN` / `BQ_SYNC_STATE_TABLE` and query for the `segment_date`
+values already registered under this `project_name` / `job_name`, then skip those
+days. Treat a state table that is not there as a fatal error rather than an empty
+skip set: the kit creates it before any producer runs, so its absence means the
+script is looking at the wrong database, and carrying on would re-export every
+historical day. Include every status, not just `success` —
 `uploading` and `failed` files are still on disk and are retried from the state table by the kit
 itself, so exporting them a second time only creates duplicates.
 

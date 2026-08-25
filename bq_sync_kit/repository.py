@@ -116,9 +116,15 @@ class SyncRepository:
                 await create_database_if_not_exists(self.settings)
             self._engine = create_engine(self.settings)
         self._table = build_state_table(self.settings.state_table, self._metadata)
-        async with self._engine.begin() as connection:
-            await connection.run_sync(self._metadata.create_all, checkfirst=True)
-            await self._add_missing_columns(connection)
+        # 建表和补列都要在锁内做：两台机器首次升级时同时启动的话，会各自看到同一
+        # 张缺列的老表并发出同样的 ADD COLUMN，后一个直接撞重复列错误、整个 run
+        # 崩在这里。这个锁和 run() 里按项目加的那个是两回事，只管 schema。
+        async with self.run_lock(f"schema:{self.settings.state_table}"):
+            async with self._engine.begin() as connection:
+                await connection.run_sync(
+                    self._metadata.create_all, checkfirst=True
+                )
+                await self._add_missing_columns(connection)
 
     async def _add_missing_columns(self, connection: Any) -> None:
         """给早于本版本创建的状态表补上新增的可空列。
@@ -431,6 +437,33 @@ class SyncRepository:
                 table.c.project_name == project_name,
                 table.c.job_name == job_name,
                 table.c.status.in_([STATUS_UPLOADING, STATUS_FAILED]),
+            )
+            .order_by(table.c.segment_date, table.c.id)
+        )
+        async with self.engine.connect() as connection:
+            rows = (await connection.execute(query)).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def unarchived_records(
+        self, project_name: str, job_name: str
+    ) -> list[dict[str, Any]]:
+        """已经成功进仓、却还没归档成功的记录。
+
+        普通 glob 发现能靠再次扫到文件来补做归档；manifest 模式下 producer 只描述
+        本轮产出，上一轮归档失败的文件不会再出现在里面，不从状态表捞回来就会永远
+        留在源目录里。
+        """
+        table = self.table
+        query = (
+            select(table)
+            .where(
+                table.c.project_name == project_name,
+                table.c.job_name == job_name,
+                table.c.status == STATUS_SUCCESS,
+                or_(
+                    table.c.archived_path.is_(None),
+                    table.c.archived_path == "",
+                ),
             )
             .order_by(table.c.segment_date, table.c.id)
         )
